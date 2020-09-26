@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.init import xavier_uniform_, constant_
 
 from sklearn.metrics import average_precision_score
 
@@ -18,8 +19,179 @@ from torch.utils.data import DataLoader
 
 from dataloader import TestDataset
 
+class ResNetBlock(nn.Module):
+    def __init__(self, channels, kernel_size, conv_layers, dropout=0.2):
+        super(ResNetBlock, self).__init__()
+        self.conv_layers = conv_layers
+        self.channels = channels
+        self.kernel_size = kernel_size
+        # assume kernel size is odd
+        self.pad = kernel_size // 2
+        self.drop = dropout
+
+        for i in range(self.conv_layers):
+            name = 'conv{}'.format(i)
+            conv = nn.Conv1d(channels, channels, kernel_size, padding=self.pad)
+            setattr(self, name, conv)
+            name = 'norm{}'.format(i)
+            norm = nn.BatchNorm1d(channels)
+            setattr(self, name, norm)
+            name = 'drop{}'.format(i)
+            drop = nn.Dropout(dropout)
+            setattr(self, name, drop)
+            name = 'actv{}'.format(i)
+            actv = nn.ReLU()
+            setattr(self, name, actv)
+
+    def reset_parameters(self):
+        for i in range(self.conv_layers):
+            name = 'conv{}'.format(i)
+            xavier_uniform_(getattr(self, name).weight.data)
+            name = 'norm{}'.format(i)
+            constant_(getattr(self, name).weight, 1)
+            constant_(getattr(self, name).bias, 1)
+
+    def forward(self, x):
+        x_res = x
+        for i in range(self.conv_layers):
+            name = 'conv{}'.format(i)
+            x = getattr(self, name)(x)
+            name = 'norm{}'.format(i)
+            x = getattr(self, name)(x)
+            name = 'drop{}'.format(i)
+            x = getattr(self, name)(x)
+            name = 'actv{}'.format(i)
+            x = getattr(self, name)(x)
+        x = x + x_res
+        return x
+
+class MapResNet(nn.Module):
+    def __init__(self,nodedim, edgedim, hidden_size, res_blocks, channels, kernel_size, in_drop, dropout):
+        super(MapResNet, self).__init__()
+        self.ndim = nodedim
+        self.edim = edgedim
+        self.blocks = res_blocks
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.pad = kernel_size // 2
+        self.in_drop = in_drop
+        self.drop = dropout
+        self.hidden = hidden_size
+
+        self.in_drop_h = nn.Dropout(in_drop)
+        self.in_drop_t = nn.Dropout(2*in_drop)
+
+        self.in_layers = [nn.Conv1d(1, channels, kernel_size, padding=self.pad),
+                          nn.BatchNorm1d(channels),
+                          nn.ReLU(),
+                          nn.Dropout(dropout)
+                          ]
+
+        for i in range(self.blocks):
+            name = 'block{}'.format(i)
+            block = ResNetBlock(channels, kernel_size, 2, dropout)
+            setattr(self, name, block)
+
+        self.lin_h_h = nn.Linear(2*nodedim+edgedim, hidden_size)
+        self.lin_c_h = nn.Linear(channels*hidden_size, nodedim*edgedim)
+        self.lin_h_t = nn.Linear(2*nodedim+edgedim, hidden_size)
+        self.lin_c_t = nn.Linear(channels*hidden_size, nodedim*edgedim)
+
+    def reset_parameters(self):
+        xavier_uniform_(self.lin_h_h)
+        xavier_uniform_(self.lin_c_h)
+        xavier_uniform_(self.lin_c_t)
+        xavier_uniform_(self.lin_h_t)
+        for i in range(self.blocks):
+            name = 'block{}'.format(i)
+            getattr(self, name).reset_parameters()
+
+    def forward(self, head, rel, tail):
+        h = self.in_drop_h(head)
+        t = self.in_drop_t(tail)
+
+        x = torch.cat([h, rel, t], dim=-1)
+
+        for layer in self.in_layers:
+            x = layer(x)
+
+        for i in range(self.blocks):
+            name = 'block{}'.format(i)
+            x = getattr(self, name)(x)
+
+        ## final linear layers to produce maps
+        x_h = self.lin_h_h(x)
+        x_h = torch.flatten(x_h, 1)
+        x_h = self.lin_c_h(x_h)
+        map_h = torch.reshape(x_h, (-1, self.edim, self.ndim))
+
+        x_t = self.lin_h_t(x)
+        x_t = torch.flatten(x_t, 1)
+        x_t = self.lin_c_t(x_t)
+        map_t = torch.reshape(x_t, (-1, self.edim, self.ndim))
+
+        ## apply maps to get score
+        return map_h, map_t
+
+class SheafNetwork(nn.Module):
+    def __init__(self,device,nodedim, edgedim, hidden_size, res_blocks, channels, kernel_size, in_drop, dropout):
+        super(SheafNetwork, self).__init__()
+        self.map_generator = MapResNet(nodedim, edgedim, hidden_size, res_blocks, channels, kernel_size, in_drop, dropout)
+        self.ndim = nodedim
+        self.edim = edgedim
+        self.valid_map = False
+        self.map_h = None
+        self.map_t = None
+        self.dev = device
+
+    def reset_parameters(self):
+        self.map_generator.reset_parameters()
+
+    def forward(self, head, relation, tail, mode):
+        if mode == 'tail-batch':
+            ## matching the negative samples to (h,r) pairs
+            head = head.expand_as(tail)
+            relation = relation.expand_as(tail)
+            head = head.reshape((-1, 1, head.shape[2]))
+            relation = relation.reshape((-1, 1, relation.shape[2]))
+            tail = tail.reshape((-1, 1, tail.shape[2]))
+        else:
+            ## matching the negative samples to (r,t) pairs
+            tail = tail.expand_as(head)
+            relation = relation.expand_as(head)
+            head = head.reshape((-1, 1, head.shape[2]))
+            relation = relation.reshape((-1, 1, relation.shape[2]))
+            tail = tail.reshape((-1, 1, tail.shape[2]))
+
+        self.map_h, self.map_t = self.map_generator(head, relation, tail)
+        self.valid_map = True
+        score = torch.matmul(self.map_h, head.transpose(1,2)) - torch.matmul(self.map_t, tail.transpose(1,2))
+        return score
+
+    def regularise(self, rel):
+        s = torch.zeros((torch.max(rel)+1,rel.shape[0]), device=self.dev)
+        s = s.scatter_(0,rel,1)
+        s = s[s.sum(1) != 0, :]
+        s_norm = s.sum(1)
+        s = s.to_sparse()
+        sdelta = torch.mm(s, self.map_h) + torch.mm(s, self.map_t)
+        sdelta = sdelta / s_norm.unsqueeze(1)
+        delta_diff = sdelta.unsqueeze(1).expand(-1, delta_.shape[0], -1) - \
+            delta_.unsqueeze(0).expand(sdelta.shape[0], -1, -1)
+        sdelta_diff = s.unsqueeze(-1).expand(-1,-1,delta_.shape[1])*delta_diff
+        reg = ((sdelta_diff).sum(dim=0)**2).sum(dim=-1)
+
+        self.valid_map=False
+        return reg.sum()
+
+    def clear_map(self):
+        self.valid_map = False
+        self.map_h = None
+        self.map_t = None
+
+
 class KGEModel(nn.Module):
-    def __init__(self, model_name, nentity, nrelation, hidden_dim, gamma, 
+    def __init__(self, model_name, nentity, nrelation, hidden_dim, gamma, args,
                  double_entity_embedding=False, double_relation_embedding=False):
         super(KGEModel, self).__init__()
         self.model_name = model_name
@@ -59,7 +231,7 @@ class KGEModel(nn.Module):
             self.modulus = nn.Parameter(torch.Tensor([[0.5 * self.embedding_range.item()]]))
         
         #Do not forget to modify this line when you add a new model in the "forward" function
-        if model_name not in ['TransE', 'DistMult', 'ComplEx', 'RotatE', 'pRotatE']:
+        if model_name not in ['TransE', 'DistMult', 'ComplEx', 'RotatE', 'pRotatE', 'Sheaf']:
             raise ValueError('model %s not supported' % model_name)
             
         if model_name == 'RotatE' and (not double_entity_embedding or double_relation_embedding):
@@ -67,6 +239,18 @@ class KGEModel(nn.Module):
 
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
+
+        if model_name == 'Sheaf':
+            device = torch.device("cuda") if args.cuda else torch.device("cpu")
+            self.sheaf_network = SheafNetwork(device,
+                                              args.ndim,
+                                              args.edim,
+                                              args.hid,
+                                              args.resblocks,
+                                              args.channels,
+                                              args.kernel,
+                                              args.indrop,
+                                              args.drop)
         
     def forward(self, sample, mode='single'):
         '''
@@ -152,7 +336,8 @@ class KGEModel(nn.Module):
             'DistMult': self.DistMult,
             'ComplEx': self.ComplEx,
             'RotatE': self.RotatE,
-            'pRotatE': self.pRotatE
+            'pRotatE': self.pRotatE,
+            'Sheaf': self.sheaf
         }
         
         if self.model_name in model_func:
@@ -196,6 +381,9 @@ class KGEModel(nn.Module):
 
         score = score.sum(dim = 2)
         return score
+
+    def sheaf(self, head, relation, tail, mode):
+        return self.sheaf_network(head, relation, tail, mode)
 
     def RotatE(self, head, relation, tail, mode):
         pi = 3.14159265358979323846
@@ -266,6 +454,10 @@ class KGEModel(nn.Module):
 
         negative_score = model((positive_sample, negative_sample), mode=mode)
 
+        if args.regularization and model.modelname == 'sheaf':
+            regularization = model.sheaf_network.regularise(positive_sample[:,1])
+            model.sheaf_network.clear_map()
+
         if args.negative_adversarial_sampling:
             #In self-adversarial sampling, we do not apply back-propagation on the sampling weight
             negative_score = (F.softmax(negative_score * args.adversarial_temperature, dim = 1).detach() 
@@ -285,6 +477,12 @@ class KGEModel(nn.Module):
             negative_sample_loss = - (subsampling_weight * negative_score).sum()/subsampling_weight.sum()
 
         loss = (positive_sample_loss + negative_sample_loss)/2
+
+        if args.regularization and model.modelname == 'sheaf':
+            regularization += model.sheaf_network.regularise(positive_sample[:,1])
+            loss = loss + regularization
+            model.sheaf_network.clear_map()
+
         
         if args.regularization != 0.0:
             #Use L3 regularization for ComplEx and DistMult

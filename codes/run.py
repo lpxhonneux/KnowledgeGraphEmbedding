@@ -67,6 +67,16 @@ def parse_args(args=None):
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
+
+
+    parser.add_argument('--ndim', type=int, default=512)
+    parser.add_argument('--edim', type=int, default=32)
+    parser.add_argument('--channels', type=int, default=64)
+    parser.add_argument('--kernel', type=int, default=5)
+    parser.add_argument('--resblocks', type=int, default=4)
+    parser.add_argument('--hid', type=int, default=32)
+    parser.add_argument('--indrop', type=int, default=0.4)
+    parser.add_argument('--drop', type=int, default=0.25)
     
     return parser.parse_args(args)
 
@@ -224,6 +234,7 @@ def main(args):
         nrelation=nrelation,
         hidden_dim=args.hidden_dim,
         gamma=args.gamma,
+        args=args,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding
     )
